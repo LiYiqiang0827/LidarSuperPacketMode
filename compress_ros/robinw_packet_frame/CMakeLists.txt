@@ -52,7 +52,7 @@ target_link_libraries(robinw_legacy_cloud
   innolidarsdkclient innolidarsdkcommon innolidarutils Threads::Threads ${PCL_LIBRARIES})
 
 add_library(robinw_cloud_decoder STATIC "${decoder_dir}/point_cloud_decoder.cpp")
-target_include_directories(robinw_cloud_decoder PUBLIC "${decoder_dir}")
+target_include_directories(robinw_cloud_decoder PUBLIC "${decoder_dir}" PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_compile_options(robinw_cloud_decoder PRIVATE -Wall -Wextra -Wpedantic)
 target_link_libraries(robinw_cloud_decoder robinw_legacy_cloud PkgConfig::ZSTD "${cpp_typesupport}")
 

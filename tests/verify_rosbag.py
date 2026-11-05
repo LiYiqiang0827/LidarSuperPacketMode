@@ -3,7 +3,6 @@
 
 import ctypes
 from hashlib import md5, sha256
-from io import BytesIO
 import os
 from pathlib import Path
 from ament_index_python.packages import get_package_prefix
@@ -16,10 +15,8 @@ HOME = Path.home()
 TRIAL = Path(os.environ.get("ROBINW_TEST_TRIAL", HOME / "packet_data_compression/1103beicai_10_51_46_trial"))
 BAG = TRIAL / "input/rosbag2_2026_11_03-10_51_46"
 WORKSPACE = Path(__file__).resolve().parents[1]
-from robinw_archive import (
-    FRAME, MAGIC_ZSTD_SHUFFLE, decode_frame, encode_frame, load_zstd, open_index,
-    read_calibration, read_exact, source_frames, split_message, topic_records, zstd_result,
-)
+from raw_bag import load_zstd, read_calibration, source_frames, split_message, topic_records, zstd_result
+from rbp2_reference import decode_message, frame_metadata
 
 os.environ.setdefault("ROS_DOMAIN_ID", "83")
 os.environ["ROS_AUTOMATIC_DISCOVERY_RANGE"] = "LOCALHOST"
@@ -61,21 +58,6 @@ def expected_from_sqlite():
     return frames, tables, repeated, sample_packets
 
 
-def frame_metadata(frame, expected_level):
-    payload = bytes(frame.data)
-    trailer = struct.pack("<II4sBB", 0x184D2A5F, 6, b"RBWF", 1, expected_level)
-    assert payload.endswith(trailer), f"Frame {frame.frame_id}: missing Zstd level {expected_level}"
-    return payload[:-len(trailer)]
-
-
-def decode_message(frame):
-    assert frame.shuffle_block_size == 42
-    payload = bytes(frame.data)
-    record = FRAME.pack(frame.complete, frame.packet_count, frame.uncompressed_size, len(payload))
-    _, packets = decode_frame(BytesIO(record + payload), 0, MAGIC_ZSTD_SHUFFLE)
-    return packets
-
-
 def decode_calibration(table):
     assert table.uncompressed_size == 50512
     compressed = bytes(table.data)
@@ -86,22 +68,8 @@ def decode_calibration(table):
     return zstd_result(zstd, output, size)
 
 
-def reference_payloads(sensor):
-    path = TRIAL / f"results/10_51_46_{sensor}_shuffle_zstd{LEVEL[sensor]}.rbwpkt"
-    with path.open("rb") as stream:
-        _, entries, magic = open_index(stream)
-        assert magic == MAGIC_ZSTD_SHUFFLE
-        result = []
-        for _, _, offset in entries:
-            stream.seek(offset)
-            _, _, _, size = FRAME.unpack(read_exact(stream, FRAME.size))
-            result.append(read_exact(stream, size))
-        return result
-
-
 def main():
     expected, tables, repeats, sample_packets = expected_from_sqlite()
-    reference = {sensor: reference_payloads(sensor) for sensor in SENSORS}
     compressed_bytes = dict.fromkeys(SENSORS, 0)
     table_sizes = dict.fromkeys(SENSORS, 0)
     seen = dict.fromkeys(SENSORS, 0)
@@ -128,9 +96,7 @@ def main():
         def callback(frame):
             index = seen[sensor]
             assert index < len(expected[sensor]), f"{sensor}: extra frame {frame.frame_id}"
-            assert frame_metadata(frame, LEVEL[sensor]) == reference[sensor][index], (
-                f"{sensor}: compressed frame differs from offline Zstd {LEVEL[sensor]} at {index}"
-            )
+            frame_metadata(frame, LEVEL[sensor])
             packets = decode_message(frame)
             actual = (frame.frame_id, frame.sensor_timestamp_us, frame.complete,
                       tuple(map(len, packets)), sha256(b"".join(packets)).digest())
@@ -199,11 +165,8 @@ def main():
             assert future.done() and future.result().results[0].successful == allowed
 
         probe_frames = []
-        expected_probe = encode_frame(sample_packets, MAGIC_ZSTD_SHUFFLE, 9)
-        assert expected_probe != encode_frame(sample_packets, MAGIC_ZSTD_SHUFFLE, 7)
-
         def probe_callback(frame):
-            assert frame_metadata(frame, 9) == expected_probe
+            frame_metadata(frame, 9)
             probe_frames.extend(decode_message(frame))
 
         checker.create_subscription(
@@ -267,7 +230,7 @@ def main():
                   f"{len(seen_repeats[sensor])} input tables, one published and latched", flush=True)
         print("PASS: timestamp/CRC excluded from MD5; angle changes detected, first table stays latched", flush=True)
         print("PASS: each frame records its actual Zstd level, including after runtime parameter updates", flush=True)
-        print("PASS: native replay matched raw packets and offline compressed frame payloads", flush=True)
+        print("PASS: native RBP2 replay restored raw packets byte for byte", flush=True)
     finally:
         for process in reversed(processes):
             if process.poll() is None:

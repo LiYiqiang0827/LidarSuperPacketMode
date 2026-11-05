@@ -14,6 +14,7 @@
 #include <openssl/evp.h>
 #include <zstd.h>
 
+#include "compact_predictor.hpp"
 #include "frame_metadata.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "rcl_interfaces/msg/parameter_descriptor.hpp"
@@ -111,8 +112,7 @@ bool read_packet_info(const Bytes & bytes, PacketInfo & info)
   info.is_last = (flags & kLastPacket) != 0;
   return true;
 }
-// Matches the offline archive: one header template, per-packet differences,
-// and optional byte lanes of equal-width point blocks.
+// RBP2 preserves original packet headers and predicts points independently in each frame.
 void normalize_frame(const Frame & frame, Bytes & normalized)
 {
   const auto * raw = frame.data.data();
@@ -133,43 +133,38 @@ void normalize_frame(const Frame & frame, Bytes & normalized)
   }
 
   const auto packet_count = frame.packet_sizes.size();
-  const auto prefix_size = 1 + kHeaderSize + changed_count * (packet_count + 1);
+  constexpr auto magic_size = sizeof(robinw::compact::kMagic);
+  const auto prefix_size = magic_size + 1 + kHeaderSize + changed_count * (packet_count + 1);
   const auto payload_size = frame.data.size() - packet_count * kHeaderSize;
-  normalized.resize(prefix_size + payload_size);
-  auto * output = normalized.data();
+  normalized.clear();
+  normalized.reserve(prefix_size + payload_size + payload_size / 8 + 1024);
+  normalized.resize(prefix_size);
+  std::memcpy(normalized.data(), robinw::compact::kMagic, magic_size);
+  auto * output = normalized.data() + magic_size;
   output[0] = static_cast<std::uint8_t>(changed_count);
   std::memcpy(output + 1, raw, kHeaderSize);
   std::memcpy(output + 1 + kHeaderSize, changed_offsets.data(), changed_count);
   auto * deltas = output + 1 + kHeaderSize + changed_count;
-  auto * payload = output + prefix_size;
-  const std::size_t width = frame.shuffle_block_size;
-  const auto block_count = width == 0 ? 0 : payload_size / width;
 
+  Bytes single, dual;
+  if (frame.shuffle_block_size == robinw::compact::kSingle) {
+    single.reserve(payload_size);
+  } else if (frame.shuffle_block_size == robinw::compact::kDouble) {
+    dual.reserve(payload_size);
+  }
   offset = 0;
-  std::size_t payload_offset = 0;
-  std::size_t block_offset = 0;
   for (const auto packet_size : frame.packet_sizes) {
     const auto * packet = raw + offset;
     for (std::size_t i = 0; i < changed_count; ++i) {
       *deltas++ = packet[changed_offsets[i]];
     }
-    const auto * blocks = packet + kHeaderSize;
-    const auto size = packet_size - kHeaderSize;
-    if (width == 0) {
-      std::memcpy(payload + payload_offset, blocks, size);
-      payload_offset += size;
-    } else {
-      const auto blocks_in_packet = size / width;
-      for (std::size_t lane = 0; lane < width; ++lane) {
-        auto * destination = payload + lane * block_count + block_offset;
-        for (std::size_t i = 0; i < blocks_in_packet; ++i) {
-          destination[i] = blocks[i * width + lane];
-        }
-      }
-      block_offset += blocks_in_packet;
-    }
+    const auto width = robinw::compact::read_word(packet + 42, 2);
+    auto & blocks = width == robinw::compact::kSingle ? single : dual;
+    blocks.insert(blocks.end(), packet + kHeaderSize, packet + packet_size);
     offset += packet_size;
   }
+  robinw::compact::encode_blocks(single, robinw::compact::kSingle, normalized);
+  robinw::compact::encode_blocks(dual, robinw::compact::kDouble, normalized);
 }
 }  // namespace
 

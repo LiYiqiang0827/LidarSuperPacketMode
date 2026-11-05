@@ -1,5 +1,8 @@
 #include "point_cloud_decoder.hpp"
 
+#include "compact_predictor.hpp"
+#include "frame_metadata.hpp"
+
 #include <array>
 #include <cmath>
 #include <cstring>
@@ -68,19 +71,24 @@ Scan::SharedPtr restore_packets(const Frame & frame, Bytes & normalized)
   {
     throw std::runtime_error("Invalid compressed frame metadata");
   }
-  decompress(frame.data, raw_size + kHeaderSize + 1, normalized);
-  if (normalized.size() < kHeaderSize + 1) {
-    throw std::runtime_error("Truncated packet header template");
+  if (!frame_zstd_level(frame.data)) {
+    throw std::runtime_error("Unsupported compressed frame format; expected RBP2");
   }
-  const std::size_t changes = normalized.front();
-  const std::size_t prefix_size = 1 + kHeaderSize + changes * (count + 1);
-  const std::size_t payload_size = raw_size - count * kHeaderSize;
-  if (changes > kHeaderSize || normalized.size() != prefix_size + payload_size ||
-    (width && payload_size % width != 0))
+  const auto payload_size = raw_size - count * kHeaderSize;
+  constexpr auto magic_size = sizeof(compact::kMagic);
+  decompress(frame.data, raw_size + payload_size / 8 + 1024, normalized);
+  if (normalized.size() < magic_size + kHeaderSize + 1 ||
+    !std::equal(compact::kMagic, compact::kMagic + magic_size, normalized.begin()))
   {
-    throw std::runtime_error("Invalid packet header deltas or payload size");
+    throw std::runtime_error("Missing RBP2 packet header template");
   }
-  const auto * header_template = normalized.data() + 1;
+  const auto * normalized_headers = normalized.data() + magic_size;
+  const std::size_t changes = normalized_headers[0];
+  const std::size_t prefix_size = magic_size + 1 + kHeaderSize + changes * (count + 1);
+  if (changes > kHeaderSize || prefix_size > normalized.size()) {
+    throw std::runtime_error("Invalid RBP2 packet header deltas");
+  }
+  const auto * header_template = normalized_headers + 1;
   const auto * offsets = header_template + kHeaderSize;
   for (std::size_t i = 0; i < changes; ++i) {
     if (offsets[i] >= kHeaderSize || (i && offsets[i] <= offsets[i - 1])) {
@@ -88,15 +96,13 @@ Scan::SharedPtr restore_packets(const Frame & frame, Bytes & normalized)
     }
   }
   const auto * deltas = offsets + changes;
-  const auto * payload = normalized.data() + prefix_size;
-  const auto total_blocks = width ? payload_size / width : 0;
-
   auto scan = std::make_shared<Scan>();
   scan->timestamp = frame.sensor_timestamp_us;
   scan->size = frame.packet_count;
   scan->is_last_scan = true;
   scan->packets.reserve(count);
-  std::size_t payload_offset = 0;
+  std::size_t single_size = 0, dual_size = 0, total_size = 0;
+  bool saw_single = false, saw_dual = false;
   for (std::size_t i = 0; i < count; ++i) {
     std::array<std::uint8_t, kHeaderSize> header{};
     std::memcpy(header.data(), header_template, header.size());
@@ -105,35 +111,49 @@ Scan::SharedPtr restore_packets(const Frame & frame, Bytes & normalized)
     }
     const auto & info = *reinterpret_cast<const InnoDataPacket *>(header.data());
     const std::size_t packet_size = info.common.size;
-    if (packet_size < kHeaderSize || packet_size - kHeaderSize > payload_size - payload_offset ||
+    const auto packet_width = static_cast<std::size_t>(info.item_size);
+    if (packet_size < kHeaderSize || packet_size - kHeaderSize > payload_size - total_size ||
       info.type != INNO_ROBINW_ITEM_TYPE_COMPACT_POINTCLOUD || info.idx != frame.frame_id ||
-      (width && (info.item_size != width || (packet_size - kHeaderSize) % width != 0)))
+      (packet_width != compact::kSingle && packet_width != compact::kDouble) ||
+      packet_size - kHeaderSize != info.item_number * packet_width)
     {
       throw std::runtime_error("Invalid restored packet header");
     }
-    const std::size_t size = packet_size - kHeaderSize;
+    const auto size = packet_size - kHeaderSize;
+    saw_single |= packet_width == compact::kSingle;
+    saw_dual |= packet_width == compact::kDouble;
+    (packet_width == compact::kSingle ? single_size : dual_size) += size;
+    total_size += size;
     auto & data = scan->packets.emplace_back().data;
     data.resize(packet_size);
     std::memcpy(data.data(), header.data(), kHeaderSize);
-    auto * blocks = data.data() + kHeaderSize;
-    if (width) {
-      for (std::size_t lane = 0; lane < width; ++lane) {
-        const auto * source = payload + lane * total_blocks + payload_offset / width;
-        for (std::size_t block = 0; block < size / width; ++block) {
-          blocks[block * width + lane] = source[block];
-        }
-      }
-    } else {
-      std::memcpy(blocks, payload + payload_offset, size);
+  }
+  const auto actual_width = saw_single && saw_dual ? 0 : saw_single ? compact::kSingle : compact::kDouble;
+  if (total_size != payload_size || width != actual_width) {
+    throw std::runtime_error("RBP2 packet payload size or block width mismatch");
+  }
+  compact::Reader reader(normalized.data() + prefix_size, normalized.size() - prefix_size);
+  const auto single = compact::decode_blocks(reader, single_size / compact::kSingle, compact::kSingle);
+  const auto dual = compact::decode_blocks(reader, dual_size / compact::kDouble, compact::kDouble);
+  if (reader.remaining() != 0) {
+    throw std::runtime_error("Unconsumed RBP2 frame payload");
+  }
+  std::size_t single_offset = 0, dual_offset = 0;
+  for (auto & packet : scan->packets) {
+    auto & data = packet.data;
+    const auto packet_width = compact::read_word(data.data() + 42, 2);
+    const bool is_single = packet_width == compact::kSingle;
+    const auto & stream = is_single ? single : dual;
+    auto & offset = is_single ? single_offset : dual_offset;
+    const auto size = data.size() - kHeaderSize;
+    if (size) {
+      std::memcpy(data.data() + kHeaderSize, stream.data() + offset, size);
+      offset += size;
     }
-    payload_offset += size;
-    const auto & packet = *reinterpret_cast<const InnoDataPacket *>(data.data());
-    if (!InnoDataPacketUtils::check_data_packet(packet, data.size())) {
+    const auto & restored = *reinterpret_cast<const InnoDataPacket *>(data.data());
+    if (!InnoDataPacketUtils::check_data_packet(restored, data.size())) {
       throw std::runtime_error("Restored packet failed Seyond SDK validation");
     }
-  }
-  if (payload_offset != payload_size) {
-    throw std::runtime_error("Unconsumed frame payload");
   }
   return scan;
 }

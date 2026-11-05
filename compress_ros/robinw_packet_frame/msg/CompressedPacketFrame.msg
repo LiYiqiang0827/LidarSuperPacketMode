@@ -5,7 +5,7 @@ bool complete
 uint32 packet_count
 # Total byte count of the original packets, including their headers.
 uint32 uncompressed_size
-# Block width used for byte shuffling: 42 (single), 74 (double), 0 (unshuffled).
+# Source block width: 42 (single), 74 (double), 0 (unshuffled).
 uint16 shuffle_block_size
-# Independent Zstd frame containing the normalized headers and the block payload.
+# Independent Zstd frame containing RBP2 headers and predicted point fields, plus a Zstd metadata trailer.
 uint8[] data

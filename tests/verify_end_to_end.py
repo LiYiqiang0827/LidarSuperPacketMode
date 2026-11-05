@@ -22,11 +22,13 @@ from robinw_packet_frame.msg import CompressedAngleCalibration, CompressedPacket
 TESTS = Path(__file__).resolve().parent
 BIN = Path(get_package_prefix("robinw_packet_frame")) / "lib/robinw_packet_frame"
 from verify_cloud_decoder_node import FIELDS, ROS_TYPES, ZONE
-from verify_rosbag import BAG, expected_from_sqlite, frame_metadata
+from verify_rosbag import BAG, expected_from_sqlite, frame_metadata, decode_message, decode_calibration
 
 SENSORS = ("front_mid", "rear_mid")
 INPUTS = [f"/iv_packets_{sensor}" for sensor in SENSORS]
 POINTS = [f"/{sensor}/points" for sensor in SENSORS]
+COMPRESSED = [f"/{sensor}/{kind}" for sensor in SENSORS
+              for kind in ("compressed_packet_frame", "compressed_angle_calibration")]
 PLAY_QOS = TESTS / "raw_playback_qos.yaml"
 RECORD_QOS = TESTS / "point_recorder_qos.yaml"
 PACKED_DTYPE = np.dtype(list(FIELDS.items()))
@@ -41,24 +43,6 @@ def rows_for(bag, topic):
 def stamp_name(stamp_ns):
     sec, ns = divmod(stamp_ns, 1_000_000_000)
     return f"{datetime.fromtimestamp(sec, ZONE):%Y_%m_%d-%H_%M_%S}_{ns // 1_000_000:03}.pcd"
-
-def reference(level, raw_frames, reference_dir):
-    root = reference_dir / f"level_{level}_attempt_1"
-    bag = root / f"robinw_zstd{level}"
-    expected = {}
-    for sensor in SENSORS:
-        known_clouds = root / "pcd_verified" / sensor
-        frames = {}
-        for msg in rows_for(bag, f"/{sensor}/compressed_packet_frame"):
-            frame = deserialize_message(msg[0], CompressedPacketFrame)
-            frame_metadata(frame, level)
-            frames[frame.frame_id] = (int(frame.sensor_timestamp_us * 1000), frame.complete,
-                                      len(frame.data), hashlib.sha256(frame.data).hexdigest())
-        assert list(frames) == [row[0] for row in raw_frames[sensor]]
-        table, = rows_for(bag, f"/{sensor}/compressed_angle_calibration")
-        table = deserialize_message(table[0], CompressedAngleCalibration)
-        expected[sensor] = frames, hashlib.sha256(table.data).hexdigest(), known_clouds
-    return expected
 
 def capture(level, target):
     output = target / f"pointcloud_zstd{level}"
@@ -84,7 +68,7 @@ def capture(level, target):
         node = rclpy.create_node("cloud_e2e_audit")
         def on_frame(frame, sensor):
             tail = bytes(frame.data[-14:])
-            expected_tail = struct.pack("<II4sBB", 0x184D2A5F, 6, b"RBWF", 1, level)
+            expected_tail = struct.pack("<II4sBB", 0x184D2A5F, 6, b"RBWF", 2, level)
             assert tail == expected_tail, (sensor, frame.frame_id, tail)
             audit[sensor].append(("frame", frame.frame_id, int(frame.sensor_timestamp_us * 1000),
                                   frame.complete, len(frame.data), hashlib.sha256(frame.data).hexdigest()))
@@ -108,12 +92,12 @@ def capture(level, target):
         start("recorder", [
             "ros2", "bag", "record", "--disable-keyboard-controls", "--storage", "sqlite3",
             "--max-cache-size", "134217728", "--qos-profile-overrides-path", str(RECORD_QOS),
-            "-o", str(output), "--topics", *POINTS])
+            "-o", str(output), "--topics", *POINTS, *COMPRESSED])
         deadline = time.monotonic() + 15
         while not (
             all(node.count_subscribers(topic) == 1 for topic in INPUTS + POINTS) and
             all(node.count_publishers(topic) == 1 for topic in POINTS) and
-            all(node.count_subscribers(f"/{sensor}/{kind}") == 2 for sensor in SENSORS
+            all(node.count_subscribers(f"/{sensor}/{kind}") == 3 for sensor in SENSORS
                 for kind in ("compressed_packet_frame", "compressed_angle_calibration"))
         ):
             assert time.monotonic() < deadline and all(p.poll() is None for p in processes.values()), (
@@ -154,14 +138,31 @@ def pcd_payload_hash(path, expected_points):
         assert points == expected_points
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
-def validate(level, output, audit, expected):
+def validate(level, output, audit, expected, tables, reference_dir):
     db = next(output.glob("*.db3"))
     with sqlite3.connect(db.as_uri() + "?mode=ro", uri=True) as conn:
         assert conn.execute("PRAGMA quick_check").fetchone() == ("ok",)
-        assert {name for name, in conn.execute("SELECT name FROM topics")} == set(POINTS)
+        assert {name for name, in conn.execute("SELECT name FROM topics")} == set(POINTS + COMPRESSED)
     results = {}
     for sensor in SENSORS:
-        refs, calibration_hash, reference_dir = expected[sensor]
+        refs = {}
+        payload_bytes = 0
+        for i, (cdr,) in enumerate(rows_for(output, f"/{sensor}/compressed_packet_frame")):
+            frame = deserialize_message(cdr, CompressedPacketFrame)
+            frame_metadata(frame, level)
+            packets = decode_message(frame)
+            actual = (frame.frame_id, frame.sensor_timestamp_us, frame.complete, tuple(map(len, packets)),
+                      hashlib.sha256(b"".join(packets)).digest())
+            assert actual == expected[sensor][i]
+            refs[frame.frame_id] = (int(frame.sensor_timestamp_us * 1000), frame.complete,
+                                    len(frame.data), hashlib.sha256(frame.data).hexdigest())
+            payload_bytes += len(frame.data)
+        assert len(refs) == len(expected[sensor])
+        (cdr,), = rows_for(output, f"/{sensor}/compressed_angle_calibration")
+        table = deserialize_message(cdr, CompressedAngleCalibration)
+        assert decode_calibration(table) == tables[sensor]
+        calibration_hash = hashlib.sha256(table.data).hexdigest()
+        sensor_pcd = reference_dir / f"level_{level}_attempt_1" / "pcd_verified" / sensor
         seen = audit[sensor]
         assert len(seen) == 149 and [item for item in seen if item[0] == "calibration"] == [
             ("calibration", calibration_hash)
@@ -188,12 +189,12 @@ def validate(level, output, audit, expected):
                               "offsets": [f.offset for f in cloud.fields], "itemsize": cloud.point_step})
             packed = np.frombuffer(cloud.data, dtype=dtype, count=cloud.width).astype(PACKED_DTYPE)
             digest = hashlib.sha256(packed.tobytes()).hexdigest()
-            assert digest == pcd_payload_hash(reference_dir / name, cloud.width), (level, sensor, name)
+            assert digest == pcd_payload_hash(sensor_pcd / name, cloud.width), (level, sensor, name)
             manifest[name] = digest
             total_points += cloud.width
         assert seen_stamps == available, (level, sensor, len(seen_stamps), len(available))
         assert len(manifest) == len(seen_stamps) == 136
-        results[sensor] = {"compressed_frames": len(refs), "skipped_before_calibration": first,
+        results[sensor] = {"payload_bytes": payload_bytes, "compressed_frames": len(refs), "skipped_before_calibration": first,
                            "recorded_clouds": len(seen_stamps), "points": total_points, "payload_hashes": manifest}
     return db.stat().st_size, results
 
@@ -205,16 +206,15 @@ def main():
     args = parser.parse_args()
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=False)
-    raw_frames, _, _, _ = expected_from_sqlite()
+    raw_frames, tables, _, _ = expected_from_sqlite()
     summary = {}
     for level in args.levels:
-        expected = reference(level, raw_frames, args.reference_dir)
         for attempt in range(1, 4):
             target = output_dir / f"zstd{level}_attempt{attempt}"
             target.mkdir()
             try:
                 bag, audit = capture(level, target)
-                size, results = validate(level, bag, audit, expected)
+                size, results = validate(level, bag, audit, raw_frames, tables, args.reference_dir)
                 break
             except (AssertionError, subprocess.SubprocessError) as error:
                 print(f"Level {level}, attempt {attempt} failed: {error}", flush=True)
