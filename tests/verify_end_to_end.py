@@ -68,7 +68,7 @@ def capture(level, target):
         node = rclpy.create_node("cloud_e2e_audit")
         def on_frame(frame, sensor):
             tail = bytes(frame.data[-14:])
-            expected_tail = struct.pack("<II4sBB", 0x184D2A5F, 6, b"RBWF", 2, level)
+            expected_tail = struct.pack("<II4sBB", 0x184D2A5F, 6, b"RBWF", 3, level)
             assert tail == expected_tail, (sensor, frame.frame_id, tail)
             audit[sensor].append(("frame", frame.frame_id, int(frame.sensor_timestamp_us * 1000),
                                   frame.complete, len(frame.data), hashlib.sha256(frame.data).hexdigest()))

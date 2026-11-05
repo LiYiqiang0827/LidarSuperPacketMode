@@ -16,7 +16,7 @@ TRIAL = Path(os.environ.get("ROBINW_TEST_TRIAL", HOME / "packet_data_compression
 BAG = TRIAL / "input/rosbag2_2026_11_03-10_51_46"
 WORKSPACE = Path(__file__).resolve().parents[1]
 from raw_bag import load_zstd, read_calibration, source_frames, split_message, topic_records, zstd_result
-from rbp2_reference import decode_message, frame_metadata
+from rbp3_reference import decode_message, frame_metadata
 
 os.environ.setdefault("ROS_DOMAIN_ID", "83")
 os.environ["ROS_AUTOMATIC_DISCOVERY_RANGE"] = "LOCALHOST"
@@ -135,7 +135,7 @@ def main():
             start(sensor, [
                 str(Path(get_package_prefix("robinw_packet_frame")) / "lib/robinw_packet_frame/packet_frame_node"),
                 "--ros-args", "-r", f"__ns:=/{sensor}", "-p", f"input_topic:=/iv_packets_{sensor}",
-                *([] if sensor == "front_mid" else ["-p", f"zstd_level:={LEVEL[sensor]}"]),
+                "-p", f"zstd_level:={LEVEL[sensor]}",
             ])
         bag = start("bag", [
             "ros2", "launch", "robinw_packet_frame", "replay_packet_bag.launch.py",
@@ -230,7 +230,7 @@ def main():
                   f"{len(seen_repeats[sensor])} input tables, one published and latched", flush=True)
         print("PASS: timestamp/CRC excluded from MD5; angle changes detected, first table stays latched", flush=True)
         print("PASS: each frame records its actual Zstd level, including after runtime parameter updates", flush=True)
-        print("PASS: native RBP2 replay restored raw packets byte for byte", flush=True)
+        print("PASS: native RBP3 replay restored raw packets byte for byte", flush=True)
     finally:
         for process in reversed(processes):
             if process.poll() is None:

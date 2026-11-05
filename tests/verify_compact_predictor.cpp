@@ -59,5 +59,5 @@ int main()
     }
     assert(rejected);
   }
-  std::cout << "PASS: RBP2 42/74-byte blocks, mixed streams, empty/edge bitmaps, and truncated input\n";
+  std::cout << "PASS: RBP3 42/74-byte blocks, mixed streams, empty/edge bitmaps, and truncated input\n";
 }

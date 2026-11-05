@@ -112,7 +112,7 @@ bool read_packet_info(const Bytes & bytes, PacketInfo & info)
   info.is_last = (flags & kLastPacket) != 0;
   return true;
 }
-// RBP2 preserves original packet headers and predicts points independently in each frame.
+// RBP3 preserves original packet headers and predicts points independently in each frame.
 void normalize_frame(const Frame & frame, Bytes & normalized)
 {
   const auto * raw = frame.data.data();
@@ -194,7 +194,7 @@ public:
     valid_levels.to_value = ZSTD_maxCLevel();
     valid_levels.step = 1;
     level.integer_range.push_back(valid_levels);
-    declare_parameter<int>("zstd_level", 7, level);
+    declare_parameter<int>("zstd_level", 1, level);
 
     frame_publisher_ =
       create_publisher<CompressedFrame>("compressed_packet_frame", rclcpp::QoS(16).reliable());

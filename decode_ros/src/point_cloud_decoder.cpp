@@ -72,7 +72,7 @@ Scan::SharedPtr restore_packets(const Frame & frame, Bytes & normalized)
     throw std::runtime_error("Invalid compressed frame metadata");
   }
   if (!frame_zstd_level(frame.data)) {
-    throw std::runtime_error("Unsupported compressed frame format; expected RBP2");
+    throw std::runtime_error("Unsupported compressed frame format; expected RBP3");
   }
   const auto payload_size = raw_size - count * kHeaderSize;
   constexpr auto magic_size = sizeof(compact::kMagic);
@@ -80,13 +80,13 @@ Scan::SharedPtr restore_packets(const Frame & frame, Bytes & normalized)
   if (normalized.size() < magic_size + kHeaderSize + 1 ||
     !std::equal(compact::kMagic, compact::kMagic + magic_size, normalized.begin()))
   {
-    throw std::runtime_error("Missing RBP2 packet header template");
+    throw std::runtime_error("Missing RBP3 packet header template");
   }
   const auto * normalized_headers = normalized.data() + magic_size;
   const std::size_t changes = normalized_headers[0];
   const std::size_t prefix_size = magic_size + 1 + kHeaderSize + changes * (count + 1);
   if (changes > kHeaderSize || prefix_size > normalized.size()) {
-    throw std::runtime_error("Invalid RBP2 packet header deltas");
+    throw std::runtime_error("Invalid RBP3 packet header deltas");
   }
   const auto * header_template = normalized_headers + 1;
   const auto * offsets = header_template + kHeaderSize;
@@ -130,13 +130,13 @@ Scan::SharedPtr restore_packets(const Frame & frame, Bytes & normalized)
   }
   const auto actual_width = saw_single && saw_dual ? 0 : saw_single ? compact::kSingle : compact::kDouble;
   if (total_size != payload_size || width != actual_width) {
-    throw std::runtime_error("RBP2 packet payload size or block width mismatch");
+    throw std::runtime_error("RBP3 packet payload size or block width mismatch");
   }
   compact::Reader reader(normalized.data() + prefix_size, normalized.size() - prefix_size);
   const auto single = compact::decode_blocks(reader, single_size / compact::kSingle, compact::kSingle);
   const auto dual = compact::decode_blocks(reader, dual_size / compact::kDouble, compact::kDouble);
   if (reader.remaining() != 0) {
-    throw std::runtime_error("Unconsumed RBP2 frame payload");
+    throw std::runtime_error("Unconsumed RBP3 frame payload");
   }
   std::size_t single_offset = 0, dual_offset = 0;
   for (auto & packet : scan->packets) {

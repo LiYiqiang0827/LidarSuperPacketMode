@@ -14,7 +14,7 @@ namespace robinw
 // Zstd skippable frame ID 0xf, six-byte payload: "RBWF", version, level.
 inline constexpr std::array<std::uint8_t, 12> kMetadataHeader{
   0x5f, 0x2a, 0x4d, 0x18, 6, 0, 0, 0, 'R', 'B', 'W', 'F'};
-inline constexpr std::uint8_t kMetadataVersion = 2;
+inline constexpr std::uint8_t kMetadataVersion = 3;
 inline constexpr std::size_t kMetadataSize = kMetadataHeader.size() + 2;
 
 inline void append_frame_metadata(std::vector<std::uint8_t> & data, int zstd_level)

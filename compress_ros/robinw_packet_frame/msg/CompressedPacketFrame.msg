@@ -7,5 +7,5 @@ uint32 packet_count
 uint32 uncompressed_size
 # Source block width: 42 (single), 74 (double), 0 (unshuffled).
 uint16 shuffle_block_size
-# Independent Zstd frame containing RBP2 headers and predicted point fields, plus a Zstd metadata trailer.
+# Independent Zstd frame containing RBP3 headers and predicted point fields, plus a Zstd metadata trailer.
 uint8[] data
