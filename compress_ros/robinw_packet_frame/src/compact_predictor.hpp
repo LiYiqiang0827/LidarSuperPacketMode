@@ -5,6 +5,9 @@
 #include <cstdint>
 #include <stdexcept>
 #include <vector>
+#if defined(__aarch64__) && defined(__ARM_NEON) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+#include <arm_neon.h>
+#endif
 
 namespace robinw::compact
 {
@@ -69,8 +72,34 @@ inline void append_planes(Bytes & out, const std::vector<std::uint32_t> & values
     }
   }
   dest += whole_bytes * count;
+  std::size_t first_tail = 0;
+#if defined(__aarch64__) && defined(__ARM_NEON) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+  const auto remainder = bits % 8;
+  if (remainder != 0) {
+    const auto shift = vdupq_n_s32(-static_cast<int>(8 * whole_bytes));
+    for (; first_tail + 8 <= count; first_tail += 8) {
+      const auto * src = values.data() + first_tail;
+      const auto lower = vmovn_u32(vshlq_u32(vld1q_u32(src), shift));
+      const auto upper = vmovn_u32(vshlq_u32(vld1q_u32(src + 4), shift));
+      const auto bytes = vmovn_u16(vcombine_u16(lower, upper));
+      auto lanes = vget_lane_u64(vreinterpret_u64_u8(bytes), 0);
+      // Transpose eight bytes so each output byte contains one complete bit plane.
+      auto swaps = (lanes ^ (lanes >> 7)) & UINT64_C(0x00aa00aa00aa00aa);
+      lanes ^= swaps ^ (swaps << 7);
+      swaps = (lanes ^ (lanes >> 14)) & UINT64_C(0x0000cccc0000cccc);
+      lanes ^= swaps ^ (swaps << 14);
+      swaps = (lanes ^ (lanes >> 28)) & UINT64_C(0x00000000f0f0f0f0);
+      lanes ^= swaps ^ (swaps << 28);
+      auto * plane = dest + first_tail / 8;
+      for (unsigned bit = 0; bit < remainder; ++bit) {
+        plane[bit * mask_bytes] = static_cast<std::uint8_t>(lanes);
+        lanes >>= 8;
+      }
+    }
+  }
+#endif
   for (unsigned bit = 0; bit < bits % 8; ++bit) {
-    for (std::size_t i = 0; i < count; ++i) {
+    for (std::size_t i = first_tail; i < count; ++i) {
       set_bit(dest + bit * mask_bytes, i, values[i] >> (8 * whole_bytes + bit));
     }
   }
