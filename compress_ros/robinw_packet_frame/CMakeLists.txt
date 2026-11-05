@@ -1,0 +1,78 @@
+cmake_minimum_required(VERSION 3.8)
+project(robinw_packet_frame)
+find_package(ament_cmake REQUIRED)
+find_package(rclcpp REQUIRED)
+find_package(rcl_interfaces REQUIRED)
+find_package(PkgConfig REQUIRED)
+find_package(OpenSSL 3.0 REQUIRED COMPONENTS Crypto)
+pkg_check_modules(ZSTD REQUIRED IMPORTED_TARGET libzstd)
+find_package(seyond REQUIRED)
+find_package(rosbag2_cpp REQUIRED)
+find_package(sensor_msgs REQUIRED)
+find_package(pcl_conversions REQUIRED)
+find_package(PCL REQUIRED COMPONENTS common)
+find_package(Threads REQUIRED)
+find_package(rosidl_default_generators REQUIRED)
+
+rosidl_generate_interfaces(${PROJECT_NAME} "msg/CompressedPacketFrame.msg" "msg/CompressedAngleCalibration.msg")
+rosidl_get_typesupport_target(cpp_typesupport ${PROJECT_NAME} "rosidl_typesupport_cpp")
+
+add_executable(packet_frame_node src/packet_frame_node.cpp)
+target_compile_features(packet_frame_node PRIVATE cxx_std_17)
+target_compile_options(packet_frame_node PRIVATE -Wall -Wextra -Wpedantic)
+ament_target_dependencies(packet_frame_node rclcpp rcl_interfaces seyond)
+target_link_libraries(packet_frame_node PkgConfig::ZSTD OpenSSL::Crypto "${cpp_typesupport}")
+# Pinned Seyond c736b03 SDK and the original PacketToPointCloud converter.
+set(project_root "${CMAKE_CURRENT_SOURCE_DIR}/../..")
+set(decoder_dir "${project_root}/decode_ros/src")
+set(pcd_dir "${project_root}/pcd_export/src")
+set(seyond_sdk "${project_root}/decode_ros/vendor/seyond_inno_sdk")
+set(seyond_tools "${project_root}/decode_ros/vendor/seyond_tools")
+function(add_seyond_sdk)
+  set(BUILD_SHARED_LIBS OFF)
+  set(MAKE_SHARED OFF)
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)")
+    set(ARCH_TAG "-arm")
+  endif()
+  add_subdirectory("${seyond_sdk}" "${CMAKE_CURRENT_BINARY_DIR}/seyond_sdk" EXCLUDE_FROM_ALL)
+endfunction()
+add_seyond_sdk()
+set_target_properties(innolidarsdkclient innolidarsdkcommon innolidarutils PROPERTIES
+  ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/vendor_lib")
+
+add_library(robinw_legacy_cloud STATIC
+  "${seyond_tools}/driver/driver_lidar.cc" "${seyond_tools}/tool/packet_to_pointcloud.cc")
+target_compile_features(robinw_legacy_cloud PUBLIC cxx_std_17)
+target_compile_definitions(robinw_legacy_cloud PUBLIC ENABLE_XYZIT)
+target_compile_options(robinw_legacy_cloud PRIVATE -Ofast)
+target_include_directories(robinw_legacy_cloud SYSTEM PUBLIC
+  "${seyond_sdk}/src" "${seyond_tools}/driver" "${seyond_tools}/tool" ${PCL_INCLUDE_DIRS})
+ament_target_dependencies(robinw_legacy_cloud rclcpp seyond sensor_msgs pcl_conversions)
+target_link_libraries(robinw_legacy_cloud
+  innolidarsdkclient innolidarsdkcommon innolidarutils Threads::Threads ${PCL_LIBRARIES})
+
+add_library(robinw_cloud_decoder STATIC "${decoder_dir}/point_cloud_decoder.cpp")
+target_include_directories(robinw_cloud_decoder PUBLIC "${decoder_dir}")
+target_compile_options(robinw_cloud_decoder PRIVATE -Wall -Wextra -Wpedantic)
+target_link_libraries(robinw_cloud_decoder robinw_legacy_cloud PkgConfig::ZSTD "${cpp_typesupport}")
+
+add_executable(compressed_bag_to_pcd "${pcd_dir}/compressed_bag_to_pcd.cpp")
+target_include_directories(compressed_bag_to_pcd PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_compile_options(compressed_bag_to_pcd PRIVATE -Wall -Wextra -Wpedantic)
+ament_target_dependencies(compressed_bag_to_pcd rclcpp rosbag2_cpp)
+target_link_libraries(compressed_bag_to_pcd robinw_cloud_decoder)
+
+add_executable(packet_cloud_decoder_node "${decoder_dir}/packet_cloud_decoder_node.cpp")
+target_compile_options(packet_cloud_decoder_node PRIVATE -Wall -Wextra -Wpedantic)
+ament_target_dependencies(packet_cloud_decoder_node rclcpp sensor_msgs)
+target_link_libraries(packet_cloud_decoder_node robinw_cloud_decoder)
+
+# Build on demand to compare the compressed path with the original raw-bag exporter.
+add_executable(legacy_packet2pointcloud EXCLUDE_FROM_ALL "${seyond_tools}/tool/packet2pointcloud.cc")
+ament_target_dependencies(legacy_packet2pointcloud rclcpp rosbag2_cpp seyond sensor_msgs)
+target_link_libraries(legacy_packet2pointcloud robinw_legacy_cloud)
+
+install(TARGETS packet_frame_node compressed_bag_to_pcd packet_cloud_decoder_node DESTINATION lib/${PROJECT_NAME})
+install(DIRECTORY launch DESTINATION share/${PROJECT_NAME})
+ament_export_dependencies(rosidl_default_runtime)
+ament_package()

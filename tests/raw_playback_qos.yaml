@@ -1,0 +1,8 @@
+/iv_packets_front_mid:
+  history: keep_last
+  depth: 128
+  reliability: reliable
+/iv_packets_rear_mid:
+  history: keep_last
+  depth: 128
+  reliability: reliable

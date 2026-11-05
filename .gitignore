@@ -1,0 +1,19 @@
+# Local bag samples and generated verification outputs
+/tests/data/
+/tests/results/
+/build/
+/install/
+/log/
+*.db3
+*.db3-*
+*.mcap
+*.pcd
+*.rbwpkt
+*.rbwexp
+
+# Generated native and Python files
+*.o
+*.a
+*.so
+__pycache__/
+*.py[cod]

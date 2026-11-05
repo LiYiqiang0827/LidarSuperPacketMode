@@ -1,0 +1,10 @@
+/front_mid/points:
+  history: keep_last
+  depth: 32
+  reliability: reliable
+  durability: volatile
+/rear_mid/points:
+  history: keep_last
+  depth: 32
+  reliability: reliable
+  durability: volatile
