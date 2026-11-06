@@ -1,8 +1,11 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <memory>
 #include <stdexcept>
 #include <vector>
 #if defined(__aarch64__) && defined(__ARM_NEON) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
@@ -43,6 +46,42 @@ inline std::vector<std::uint64_t> scan_order(const Bytes & blocks, std::size_t w
   return order;
 }
 
+
+inline std::vector<std::uint64_t> encoder_scan_order(const Bytes & blocks, std::size_t width)
+{
+  constexpr std::size_t kBins = 1024;
+  std::array<std::array<std::size_t, kBins>, 3> counts{};
+  std::vector<std::uint64_t> order(blocks.size() / width);
+  for (std::size_t i = 0; i < order.size(); ++i) {
+    const auto key = scan_key(blocks.data() + i * width);
+    order[i] = (std::uint64_t(key) << 32) | i;
+    for (unsigned pass = 0; pass < counts.size(); ++pass) {
+      ++counts[pass][(key >> (10 * pass)) & (kBins - 1)];
+    }
+  }
+  std::vector<std::uint64_t> scratch(order.size());
+  for (unsigned pass = 0; pass < counts.size(); ++pass) {
+    auto & offsets = counts[pass];
+    std::size_t prefix = 0;
+    bool all_same = false;
+    for (auto & offset : offsets) {
+      all_same |= offset == order.size();
+      const auto count = offset;
+      offset = prefix;
+      prefix += count;
+    }
+    if (all_same) {
+      continue;
+    }
+    for (const auto value : order) {
+      const auto bucket = (value >> (32 + 10 * pass)) & (kBins - 1);
+      scratch[offsets[bucket]++] = value;
+    }
+    order.swap(scratch);
+  }
+  return order;
+}
+
 inline std::size_t bitmap_size(std::size_t count) { return (count + 7) / 8; }
 
 inline std::uint32_t bit_at(const std::uint8_t * bitmap, std::size_t i)
@@ -55,12 +94,12 @@ inline void set_bit(std::uint8_t * bitmap, std::size_t i, std::uint32_t bit)
   bitmap[i / 8] |= (bit & 1U) << (i % 8);
 }
 
-inline void append_planes(Bytes & out, const std::vector<std::uint32_t> & values, unsigned bits)
+template<class Word>
+inline void append_planes(Bytes & out, const Word * values, std::size_t count, unsigned bits)
 {
-  if (values.empty()) {
+  if (count == 0) {
     return;
   }
-  const auto count = values.size();
   const auto whole_bytes = bits / 8;
   const auto mask_bytes = bitmap_size(count);
   const auto start = out.size();
@@ -78,10 +117,16 @@ inline void append_planes(Bytes & out, const std::vector<std::uint32_t> & values
   if (remainder != 0) {
     const auto shift = vdupq_n_s32(-static_cast<int>(8 * whole_bytes));
     for (; first_tail + 8 <= count; first_tail += 8) {
-      const auto * src = values.data() + first_tail;
-      const auto lower = vmovn_u32(vshlq_u32(vld1q_u32(src), shift));
-      const auto upper = vmovn_u32(vshlq_u32(vld1q_u32(src + 4), shift));
-      const auto bytes = vmovn_u16(vcombine_u16(lower, upper));
+      const auto * src = values + first_tail;
+      uint8x8_t bytes;
+      if constexpr (sizeof(Word) == sizeof(std::uint16_t)) {
+        const auto shift16 = vdupq_n_s16(-static_cast<int>(8 * whole_bytes));
+        bytes = vmovn_u16(vshlq_u16(vld1q_u16(src), shift16));
+      } else {
+        const auto lower = vmovn_u32(vshlq_u32(vld1q_u32(src), shift));
+        const auto upper = vmovn_u32(vshlq_u32(vld1q_u32(src + 4), shift));
+        bytes = vmovn_u16(vcombine_u16(lower, upper));
+      }
       auto lanes = vget_lane_u64(vreinterpret_u64_u8(bytes), 0);
       // Transpose eight bytes so each output byte contains one complete bit plane.
       auto swaps = (lanes ^ (lanes >> 7)) & UINT64_C(0x00aa00aa00aa00aa);
@@ -165,7 +210,7 @@ inline void encode_blocks(const Bytes & blocks, std::size_t width, Bytes & outpu
   }
   const auto slots = (width - kBlockHeader) / 4;
   // Block headers remain in wire order so the decoder can derive the scan permutation.
-  const auto order = scan_order(blocks, width);
+  const auto order = encoder_scan_order(blocks, width);
   std::vector<std::uint32_t> delta(count);
   for (std::size_t offset = 0; offset < kBlockHeader; offset += 2) {
     std::int32_t previous = 0;
@@ -174,55 +219,72 @@ inline void encode_blocks(const Bytes & blocks, std::size_t width, Bytes & outpu
       delta[i] = zigzag(wrapped(word - previous, 16));
       previous = word;
     }
-    append_planes(output, delta, 16);
+    append_planes(output, delta.data(), delta.size(), 16);
   }
   const auto masks_start = output.size();
   output.resize(masks_start + slots * bitmap_size(count), 0);
-  std::vector<std::uint32_t> low, high, reflectance, flags;
-  low.reserve(slots * count);
-  high.reserve(slots * count);
-  reflectance.reserve(slots * count);
-  flags.reserve(slots * count);
+  const auto points = slots * count;
+  // The emitted streams contain at most 12 bits per value.
+  std::unique_ptr<std::uint16_t[]> low(new std::uint16_t[points]);
+  std::unique_ptr<std::uint16_t[]> sparse(new std::uint16_t[points]);
+  std::unique_ptr<std::uint16_t[]> reflectance(new std::uint16_t[points]);
+  std::unique_ptr<std::uint16_t[]> flags(new std::uint16_t[points]);
+  Bytes high_mask(bitmap_size(points), 0);
+  std::size_t valid_count = 0, high_count = 0;
+  // Reset the predictors once per scan line and reuse the ordered point addresses.
+  struct ScanLine
+  {
+    std::size_t end;
+  };
+  std::vector<const std::uint8_t *> ordered_points;
+  std::vector<ScanLine> scan_lines;
+  ordered_points.reserve(count);
+  for (std::size_t i = 0; i < count; ++i) {
+    ordered_points.push_back(blocks.data() + std::uint32_t(order[i]) * width + kBlockHeader);
+    if (i + 1 == count || (order[i] >> 48) != (order[i + 1] >> 48)) {
+      scan_lines.push_back({i + 1});
+    }
+  }
   for (std::size_t slot = 0; slot < slots; ++slot) {
     auto * mask = output.data() + masks_start + slot * bitmap_size(count);
-    std::uint32_t previous_line = UINT32_MAX, previous_valid_line = UINT32_MAX;
-    std::int32_t previous_reflectance = 0, previous_radius = 0;
-    for (std::size_t i = 0; i < count; ++i) {
-      const auto * block = blocks.data() + std::uint32_t(order[i]) * width;
-      const auto line = std::uint32_t(order[i] >> 48);
-      const auto value = read_word(block + kBlockHeader + slot * 4, 4);
-      const auto reflect = static_cast<std::int32_t>(value & 0xfff);
-      reflectance.push_back(zigzag(wrapped(reflect - (line == previous_line ? previous_reflectance : 0), 12)));
-      flags.push_back(value >> 30);
-      previous_reflectance = reflect;
-      previous_line = line;
-      const auto radius = static_cast<std::int32_t>((value >> 12) & kRadiusMask);
-      if (radius == 0) {
-        continue;
+    auto * reflect_out = reflectance.get() + slot * count;
+    auto * flags_out = flags.get() + slot * count;
+    std::size_t i = 0;
+    for (const auto & line : scan_lines) {
+      std::int32_t previous_reflectance = 0, previous_radius = 0;
+      for (; i < line.end; ++i) {
+        std::uint32_t value;
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+        std::memcpy(&value, ordered_points[i] + slot * 4, sizeof value);
+#else
+        value = read_word(ordered_points[i] + slot * 4, 4);
+#endif
+        const auto reflect = static_cast<std::int32_t>(value & 0xfff);
+        reflect_out[i] = zigzag(wrapped(reflect - previous_reflectance, 12));
+        flags_out[i] = value >> 30;
+        previous_reflectance = reflect;
+        const auto radius = static_cast<std::int32_t>((value >> 12) & kRadiusMask);
+        if (radius == 0) {
+          continue;
+        }
+        const auto residual = zigzag(radius - previous_radius);
+        previous_radius = radius;
+        set_bit(mask, i, 1);
+        low[valid_count] = residual & 0x7f;
+        const auto high = residual >> 7;
+        // A zero high part leaves the cursor in place, so its slot is overwritten or omitted.
+        sparse[high_count] = high - 1;
+        set_bit(high_mask.data(), valid_count, high != 0);
+        ++valid_count;
+        high_count += high != 0;
       }
-      const auto residual = zigzag(radius - (line == previous_valid_line ? previous_radius : 0));
-      set_bit(mask, i, 1);
-      low.push_back(residual & 0x7f);
-      high.push_back(residual >> 7);
-      previous_valid_line = line;
-      previous_radius = radius;
     }
   }
-  // All channels share the field streams. Nonzero high parts are stored as value minus one.
-  append_planes(output, low, 7);
-  const auto high_mask_start = output.size();
-  output.resize(high_mask_start + bitmap_size(high.size()), 0);
-  auto * high_mask = output.data() + high_mask_start;
-  std::vector<std::uint32_t> sparse;
-  for (std::size_t i = 0; i < high.size(); ++i) {
-    if (high[i] != 0) {
-      set_bit(high_mask, i, 1);
-      sparse.push_back(high[i] - 1);
-    }
-  }
-  append_planes(output, sparse, 12);
-  append_planes(output, reflectance, 12);
-  append_planes(output, flags, 2);
+  append_planes(output, low.get(), valid_count, 7);
+  output.insert(output.end(), high_mask.begin(), high_mask.begin() + bitmap_size(valid_count));
+  append_planes(output, sparse.get(), high_count, 12);
+  append_planes(output, reflectance.get(), points, 12);
+  append_planes(output, flags.get(), points, 2);
 }
 
 inline std::int32_t unzigzag(std::uint32_t value)
