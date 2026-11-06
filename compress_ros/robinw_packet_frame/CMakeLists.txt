@@ -39,6 +39,9 @@ endfunction()
 add_seyond_sdk()
 set_target_properties(innolidarsdkclient innolidarsdkcommon innolidarutils PROPERTIES
   ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/vendor_lib")
+target_include_directories(packet_frame_node SYSTEM PRIVATE "${seyond_sdk}/src")
+target_link_libraries(packet_frame_node innolidarsdkcommon innolidarutils)
+
 
 add_library(robinw_legacy_cloud STATIC
   "${seyond_tools}/driver/driver_lidar.cc" "${seyond_tools}/tool/packet_to_pointcloud.cc")
@@ -52,9 +55,9 @@ target_link_libraries(robinw_legacy_cloud
   innolidarsdkclient innolidarsdkcommon innolidarutils Threads::Threads ${PCL_LIBRARIES})
 
 add_library(robinw_cloud_decoder STATIC "${decoder_dir}/point_cloud_decoder.cpp")
-target_include_directories(robinw_cloud_decoder PUBLIC "${decoder_dir}" PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_include_directories(robinw_cloud_decoder PUBLIC "${decoder_dir}" "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_compile_options(robinw_cloud_decoder PRIVATE -Wall -Wextra -Wpedantic)
-target_link_libraries(robinw_cloud_decoder robinw_legacy_cloud PkgConfig::ZSTD "${cpp_typesupport}")
+target_link_libraries(robinw_cloud_decoder robinw_legacy_cloud PkgConfig::ZSTD OpenSSL::Crypto "${cpp_typesupport}")
 
 add_executable(compressed_bag_to_pcd "${pcd_dir}/compressed_bag_to_pcd.cpp")
 target_include_directories(compressed_bag_to_pcd PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")

@@ -11,9 +11,9 @@
 #include <string>
 #include <vector>
 
-#include <openssl/evp.h>
 #include <zstd.h>
 
+#include "calibration_id.hpp"
 #include "compact_predictor.hpp"
 #include "frame_metadata.hpp"
 #include "rclcpp/rclcpp.hpp"
@@ -21,6 +21,7 @@
 #include "robinw_packet_frame/msg/compressed_angle_calibration.hpp"
 #include "robinw_packet_frame/msg/compressed_packet_frame.hpp"
 #include "seyond/msg/seyond_scan.hpp"
+#include "sdk_common/inno_lidar_packet_utils.h"
 
 namespace
 {
@@ -31,23 +32,6 @@ using Scan = seyond::msg::SeyondScan;
 using Clock = std::chrono::steady_clock;
 
 constexpr std::size_t kHeaderSize = 70;
-// InnoAngleHVTable contains a 2-byte version, 8-byte ID, angle array and 512 reserved bytes.
-constexpr std::size_t kAngleTableOffset = kHeaderSize + 2 + 8;
-constexpr std::size_t kAngleTableSize = 4 * 65 * 6 * 8 * 4;
-constexpr std::size_t kCalibrationSize = kAngleTableOffset + kAngleTableSize + 512;
-using CalibrationDigest = std::array<unsigned char, 16>;
-
-std::string digest_hex(const CalibrationDigest & digest)
-{
-  constexpr char digits[] = "0123456789abcdef";
-  std::string result;
-  result.reserve(digest.size() * 2);
-  for (const auto byte : digest) {
-    result.push_back(digits[byte >> 4]);
-    result.push_back(digits[byte & 0xf]);
-  }
-  return result;
-}
 constexpr std::uint16_t kDataMagic = 0x176a;
 constexpr std::uint8_t kCompactType = 13;
 constexpr std::uint8_t kCalibrationType = 100;
@@ -74,6 +58,7 @@ struct Frame
   std::uint64_t frame_id{0};
   double sensor_timestamp_us{0};
   std::uint16_t shuffle_block_size{0};
+  robinw::CalibrationId calibration{};
   std::vector<std::uint32_t> packet_sizes;
   Bytes data;
 };
@@ -183,12 +168,8 @@ public:
     if (!zstd_context_) {
       throw std::runtime_error("Could not create Zstd compression context");
     }
-    // Initialize OpenSSL's MD5 implementation before accepting lidar packets.
-    if (!md5_ || !md5_context_ || EVP_DigestInit_ex(md5_context_.get(), md5_.get(), nullptr) != 1) {
-      throw std::runtime_error("Could not initialize angle table MD5");
-    }
     rcl_interfaces::msg::ParameterDescriptor level;
-    level.description = "Zstd level for frames and the first calibration table";
+    level.description = "Zstd level for frames and calibration tables";
     rcl_interfaces::msg::IntegerRange valid_levels;
     valid_levels.from_value = 1;
     valid_levels.to_value = ZSTD_maxCLevel();
@@ -199,7 +180,7 @@ public:
     frame_publisher_ =
       create_publisher<CompressedFrame>("compressed_packet_frame", rclcpp::QoS(16).reliable());
     calibration_publisher_ = create_publisher<Calibration>(
-      "compressed_angle_calibration", rclcpp::QoS(1).reliable().transient_local());
+      "compressed_angle_calibration", rclcpp::QoS(4).reliable().transient_local());
 
     auto input_qos = rclcpp::QoS(128);
     if (!input_reliable) {
@@ -235,45 +216,37 @@ private:
     return level;
   }
 
-  CalibrationDigest calibration_digest(const Bytes & bytes)
-  {
-    CalibrationDigest digest{};
-    unsigned int size = 0;
-    auto * context = md5_context_.get();
-    if (EVP_DigestInit_ex(context, md5_.get(), nullptr) != 1 ||
-      EVP_DigestUpdate(context, bytes.data() + kAngleTableOffset, kAngleTableSize) != 1 ||
-      EVP_DigestFinal_ex(context, digest.data(), &size) != 1 || size != digest.size())
-    {
-      throw std::runtime_error("Could not compute angle table MD5");
-    }
-    return digest;
-  }
-
   void accept_calibration(const Bytes & bytes)
   {
     if (!has_header(bytes, kCalibrationType) ||
-      read_le<std::uint32_t>(bytes, 10) != kCalibrationSize || bytes.size() < kCalibrationSize)
+      read_le<std::uint32_t>(bytes, 10) != robinw::kCalibrationSize ||
+      bytes.size() < robinw::kCalibrationSize ||
+      !InnoDataPacketUtils::check_data_packet(
+        *reinterpret_cast<const InnoDataPacket *>(bytes.data()), robinw::kCalibrationSize))
     {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "Ignoring invalid type-100 table");
       return;
     }
     try {
-      const auto digest = calibration_digest(bytes);
-      if (last_calibration_digest_) {
-        if (digest != *last_calibration_digest_) {
-          RCLCPP_WARN(
-            get_logger(), "Angle table content changed (MD5 %s -> %s); keeping first published table",
-            digest_hex(*last_calibration_digest_).c_str(), digest_hex(digest).c_str());
-          last_calibration_digest_ = digest;
-        }
+      const auto id = robinw::calibration_id(bytes);
+      if (active_calibration_ == id) {
         return;
       }
       auto table = std::make_unique<Calibration>();
-      table->uncompressed_size = kCalibrationSize;
-      compress(bytes.data(), kCalibrationSize, table->data);
+      table->uncompressed_size = robinw::kCalibrationSize;
+      table->calibration_id = id;
+      compress(bytes.data(), robinw::kCalibrationSize, table->data);
       calibration_publisher_->publish(std::move(table));
-      last_calibration_digest_ = digest;
-      RCLCPP_INFO(get_logger(), "Published first angle table (MD5 %s)", digest_hex(digest).c_str());
+      if (frame_) {
+        // The source did not give a frame boundary for this change.
+        discarded_frame_ = frame_->frame_id;
+        frame_.reset();
+        RCLCPP_WARN(get_logger(), "Discarding frame %llu at angle table change",
+          static_cast<unsigned long long>(*discarded_frame_));
+      }
+      active_calibration_ = id;
+      RCLCPP_INFO(get_logger(), "Published angle calibration %s",
+        robinw::calibration_id_hex(id).c_str());
     } catch (const std::exception & error) {
       RCLCPP_ERROR(get_logger(), "Calibration processing failed: %s", error.what());
     }
@@ -282,23 +255,29 @@ private:
   void consume(const Scan & scan)
   {
     for (const auto & packet : scan.packets) {
+      PacketInfo info{};
+      const bool valid_packet = read_packet_info(packet.data, info);
+      if (valid_packet && frame_ && frame_->frame_id != info.frame_id) {
+        publish_frame(false);
+      }
       if (packet.has_table) {
         accept_calibration(packet.table);
       }
-      PacketInfo info{};
-      if (!read_packet_info(packet.data, info)) {
+      if (!valid_packet) {
         if (frame_) {
           continuous_ = false;
         }
         RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "Ignoring invalid type-13 packet");
         continue;
       }
-      if (frame_ && frame_->frame_id != info.frame_id) {
-        publish_frame(false);
+      if (discarded_frame_ == info.frame_id) {
+        continue;
       }
+      discarded_frame_.reset();
       if (!frame_) {
         frame_ = std::make_unique<Frame>();
         frame_->frame_id = info.frame_id;
+        frame_->calibration = active_calibration_;
         frame_->sensor_timestamp_us = info.sensor_timestamp_us;
         frame_->shuffle_block_size = info.block_size;
         frame_->packet_sizes.reserve(packet_count_hint_);
@@ -335,6 +314,7 @@ private:
       normalize_frame(*frame, normalized_);
       auto output = std::make_unique<CompressedFrame>();
       output->frame_id = frame->frame_id;
+      output->calibration_id = frame->calibration;
       output->sensor_timestamp_us = frame->sensor_timestamp_us;
       output->complete = complete;
       output->packet_count = static_cast<std::uint32_t>(frame->packet_sizes.size());
@@ -358,11 +338,8 @@ private:
   Bytes normalized_;
   std::unique_ptr<ZSTD_CCtx, decltype(&ZSTD_freeCCtx)> zstd_context_{
     ZSTD_createCCtx(), ZSTD_freeCCtx};
-  std::unique_ptr<EVP_MD, decltype(&EVP_MD_free)> md5_{
-    EVP_MD_fetch(nullptr, "MD5", nullptr), EVP_MD_free};
-  std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> md5_context_{
-    EVP_MD_CTX_new(), EVP_MD_CTX_free};
-  std::optional<CalibrationDigest> last_calibration_digest_;
+  robinw::CalibrationId active_calibration_{};
+  std::optional<std::uint64_t> discarded_frame_;
   Clock::time_point last_packet_;
   std::chrono::milliseconds timeout_{0};
   std::size_t packet_count_hint_{0};

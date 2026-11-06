@@ -21,10 +21,10 @@ namespace
 using Bytes = std::vector<std::uint8_t>;
 using Scan = seyond::msg::SeyondScan;
 constexpr std::size_t kHeaderSize = sizeof(InnoDataPacket);
-constexpr std::size_t kCalibrationSize = kHeaderSize + sizeof(InnoAngleHVTable);
 constexpr std::size_t kMaxPacketCount = 65536;  // The sensor sub-index is uint16.
 constexpr std::size_t kMaxFrameSize = 64 * 1024 * 1024;
-static_assert(kHeaderSize == 70 && kCalibrationSize == 50512);
+static_assert(kHeaderSize == kCalibrationHeaderSize &&
+  kHeaderSize + sizeof(InnoAngleHVTable) == kCalibrationSize);
 
 void decompress(const Bytes & compressed, std::size_t max_size, Bytes & decoded)
 {
@@ -160,20 +160,36 @@ Scan::SharedPtr restore_packets(const Frame & frame, Bytes & normalized)
 
 }  // namespace
 
-bool PointCloudDecoder::has_calibration() const
-{
-  return converter_.hasAngleTable();
-}
-
 void PointCloudDecoder::update_calibration(const Calibration & message)
 {
-  converter_.setAngleTable(decode_calibration(message));
+  auto bytes = decode_calibration(message);
+  const auto id = calibration_id(bytes);
+  if (id != message.calibration_id) {
+    throw std::runtime_error("Calibration ID does not match angle table");
+  }
+  const auto old = std::find_if(tables_.begin(), tables_.end(), [&id](const auto & table) {
+    return table.id == id;
+  });
+  if (old != tables_.end()) {
+    tables_.erase(old);
+  }
+  tables_.push_back(Table{id, std::move(bytes)});
+  if (capacity_ && tables_.size() > capacity_) {
+    tables_.pop_front();
+  }
 }
 
 sensor_msgs::msg::PointCloud2::SharedPtr PointCloudDecoder::decode(const Frame & frame)
 {
-  if (!has_calibration()) {
+  const auto table = std::find_if(tables_.begin(), tables_.end(), [&frame](const auto & value) {
+    return value.id == frame.calibration_id;
+  });
+  if (table == tables_.end()) {
     return nullptr;
+  }
+  if (applied_ != frame.calibration_id) {
+    converter_.setAngleTable(table->data);
+    applied_ = frame.calibration_id;
   }
   if (!std::isfinite(frame.sensor_timestamp_us) || frame.sensor_timestamp_us < 0 ||
     frame.sensor_timestamp_us >= (1.0 + std::numeric_limits<std::int32_t>::max()) * 1e6)

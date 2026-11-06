@@ -9,9 +9,9 @@
 | `compress_ros/` | ROS 消息定义、组包压缩节点、共享 RBP3 编解码器和原包回放入口 | `robinw_packet_frame/src/packet_frame_node.cpp`、`robinw_packet_frame/msg/`、`robinw_packet_frame/launch/` |
 | `decode_ros/` | 在线解压节点、在线和离线共用的点云解码器、Seyond SDK 与转换器 | `src/packet_cloud_decoder_node.cpp`、`src/point_cloud_decoder.cpp`、`vendor/` |
 | `pcd_export/` | 从压缩 rosbag 导出逐帧 binary PCD | `src/compressed_bag_to_pcd.cpp`、`src/pcd_writer.hpp` |
-| `tests/` | 实包回归、校准表时序、参考归档工具、测试 QoS 和交付日志 | `verify_end_to_end.py`、`verify_calibration_order.py`、`verify_cloud_decoder_node.py`、`verify_rosbag.py` |
+| `tests/` | 实包回归、校准表时序、点云与 PCD 对比 | `verify_end_to_end.py` |
 
-为了保持历史 rosbag 和部署命令兼容，ROS 包名仍为 `robinw_packet_frame`，三套可执行程序仍由同一个 ROS 包构建。CMake 入口在 `compress_ros/robinw_packet_frame/CMakeLists.txt`，它引用另外两个目录中的源文件。当前安装只支持 RBP3 单帧预测格式。`compress_ros/seyond` 是上游 `SeyondScan`、`SeyondPacket` 的兼容消息包。Seyond 源码取自 `seyond_sw_ros` 提交 `c736b03ccd3c821f5ea8d1392dc9d8263594b521`，许可证位于 `decode_ros/vendor/seyond_inno_sdk/LICENSE`。转换器有本地的标定表更新接口，供离线和在线解码共用。
+ROS 包名仍为 `robinw_packet_frame`，三套可执行程序仍由同一个 ROS 包构建。CMake 入口在 `compress_ros/robinw_packet_frame/CMakeLists.txt`，它引用另外两个目录中的源文件。当前安装只支持 RBP3 单帧预测格式。`compress_ros/seyond` 是上游 `SeyondScan`、`SeyondPacket` 的兼容消息包。Seyond 源码取自 `seyond_sw_ros` 提交 `c736b03ccd3c821f5ea8d1392dc9d8263594b521`，许可证位于 `decode_ros/vendor/seyond_inno_sdk/LICENSE`。转换器有本地的标定表更新接口，供离线和在线解码共用。
 
 ```mermaid
 flowchart LR
@@ -33,7 +33,7 @@ flowchart LR
 |---|---|---|
 | `/iv_packets_front_mid` 或 `/iv_packets_rear_mid` | `seyond/msg/SeyondScan` | 压缩端订阅，默认 reliable、深度 128。发布端为 best effort 时，压缩端可设 `input_reliable:=false` |
 | `compressed_packet_frame` | `robinw_packet_frame/msg/CompressedPacketFrame` | reliable、深度 16，每条消息携带一帧或一条已标记的残帧 |
-| `compressed_angle_calibration` | `robinw_packet_frame/msg/CompressedAngleCalibration` | reliable、transient-local、深度 1，解码订阅同样使用 transient-local |
+| `compressed_angle_calibration` | `robinw_packet_frame/msg/CompressedAngleCalibration` | reliable、transient-local、深度 4，解码订阅同样使用 transient-local |
 | `points` | `sensor_msgs/msg/PointCloud2` | reliable、深度 4，在线解码器输出；可通过 ROS remap 更改话题名 |
 
 压缩参数 `zstd_level` 默认 1，允许 1 到运行时 Zstd 库的最高常规等级，可通过 `ros2 param set` 在线更新。每个帧在实际压缩时读取当前等级。`flush_timeout_ms` 默认 500，设 0 可关闭超时输出。在线解码器的 `frame_id` 参数默认 `seyond`，是点云坐标系名。它与压缩消息里的整数雷达帧号是两个独立字段。
@@ -99,21 +99,21 @@ Zstd 库会跳过这个尾帧。项目解码器检查版本 3 与 `RBP3` 标识�
 
 Robin W type-100 的有效包为 50,512 字节。依次包含 70 字节包头、2 字节版本、8 字节表 ID、49,920 字节角度数组和 512 字节保留区。SDK 的角度数组为 `4 × 65 × 6 × 8` 对 16 位角度，每对 4 字节。ROS 中可能附有 2,000,000 字节的容器填充。
 
-压缩节点对角度数组的字节区间 `[80, 50000)` 计算 MD5。OpenSSL MD5 在启动时初始化并复用。首份有效表按原样压缩有效的 50,512 字节并发布一次。后续角度变化会记录告警，当前编码节点的发布策略是每路只发布首表。解码端可以应用多次表更新，前提是上游或 bag 实际提供了这些更新。表消息的 `data` 是独立 Zstd 帧，`uncompressed_size` 为 50,512，表消息无需解析帧尾元数据。
+编码器将校准表版本和角度数组计算 SHA-256，取前 16 字节作为 `calibration_id`。压缩帧和压缩校准表消息各自带这个字段。同表重发不改变 ID，表变更时发布新表。RBP3 字节载荷保持原样。两端需要使用同一版 ROS 消息定义。
 
 ## 4. 解码、标定时序与点云
 
-在线与 PCD 导出均调用 `PointCloudDecoder`。先验证并解压压缩帧，恢复原始 type-13 packet，再交给 Seyond SDK 使用当前 type-100 表转换。默认沿用旧工具的坐标模式 3，输出单位为米，坐标轴为前、左、上，默认距离范围 0.1 至 2000 米。外参变换由接入侧另行管理。
+在线与 PCD 导出均调用 `PointCloudDecoder`。先验证并解压压缩帧，恢复原始 type-13 packet，再交给 Seyond SDK 使用帧指定的 type-100 表转换。默认沿用旧工具的坐标模式 3，输出单位为米，坐标轴为前、左、上，默认距离范围 0.1 至 2000 米。外参变换由接入侧另行管理。
 
-- 在线按回调处理顺序维护当前表。初始为空，首份有效表到达前收到的帧直接跳过。后续有效表覆盖当前表，后续点云使用新表。无效表保留之前的有效表。跨话题交付取决于 ROS 传输，运行时不做回溯补帧。
-- 离线将同一路帧和表读入同一个 bag reader，按 bag 的录制时间前进。SQLite 中相同时间按消息记录顺序处理。首表前的帧跳过，已存在的残帧在有表时可导出并在日志标记。在线 `PointCloud2` 的标准字段中没有 `complete` 位，若接入需要检查完整性，应保留或并行订阅压缩帧元数据。
+- 在线按 ID 缓存校准表。帧比对应表先到时最多等待 500 ms，超时跳过。收到的表必须与声明的 ID 一致。
+- PCD 导出先扫描录包中的表，再按每帧 ID 解码，支持表晚于对应帧录到。在线仍发布标准 `PointCloud2`。压缩帧和 rosbag 保留 `complete`，缺包帧仍可在线出点和离线导出。
 - 点云头时间取原始雷达帧时间，单位转换为 ROS 的秒与纳秒。逐点时间为 packet 时间加上 SDK 提供的 `ts_10us` 偏移，以 float64 秒输出。`PointCloud2.header.frame_id` 是配置的坐标系字符串。
 - 输出字段顺序为 `x y z timestamp intensity flags elongation scan_id scan_idx is_2nd_return`。坐标和强度为 float32，时间为 float64，`scan_id` 和 `scan_idx` 为 uint16，另外三个字段为 uint8。读取 ROS 点云时使用 `PointField.offset`、`point_step`、`row_step`，考虑 PCL 对齐填充。PCD 去掉这些填充，每点 31 字节。文件名格式为 `YYYY_MM_DD-HH_MM_SS_mmm.pcd`，以雷达帧时间和进程时区生成。
-- 在线遇到坏帧会告警并继续接收下一帧。离线导出对无效数据、写盘错误或文件名冲突返回错误，首表前的正常跳过会写入统计。
+- 在线遇到坏帧会告警并继续接收下一帧。离线导出对无效数据、写盘错误或文件名冲突返回错误，缺少匹配校准表的帧会写入跳过统计。
 
 ## 5. 构建、运行和录制
 
-在 Thor 上依赖 ROS 2 Jazzy、colcon、C++17、`pkg-config`、`libzstd-dev`、OpenSSL 3 的 `libssl-dev`、`libpcl-dev`、`ros-jazzy-pcl-conversions`、`ros-jazzy-rosbag2-cpp`、`ros-jazzy-rosbag2-storage-sqlite3` 与 `ros-jazzy-sensor-msgs`。Python 验证另用 ROS 的 `rclpy`、`rosbag2_py` 和 NumPy。
+在 Thor 上依赖 ROS 2 Jazzy、colcon、C++17、`pkg-config`、`libzstd-dev`、OpenSSL 3 的 `libssl-dev`、`libpcl-dev`、`ros-jazzy-pcl-conversions`、`ros-jazzy-rosbag2-cpp`、`ros-jazzy-rosbag2-storage-sqlite3` 与 `ros-jazzy-sensor-msgs`。Python 验证另用 ROS 的 `rclpy`、`rosbag2_py`、NumPy 和 PyYAML。
 
 ```bash
 cd /home/agx/lidar_super_packet_mode
@@ -161,20 +161,26 @@ TZ=Asia/Shanghai ros2 run robinw_packet_frame compressed_bag_to_pcd \
 
 ## 6. 测试与证据
 
-验收用原包 `rosbag2_2026_11_03-10_51_46`，默认试验目录为
-`/home/agx/packet_data_compression/1103beicai_10_51_46_trial`。可以通过环境变量
-`ROBINW_TEST_TRIAL` 指向包含同名原包及参考数据的试验目录。
+当前实验录包是 `~/mikelee/seyond_capture_front_mid_2026_11_06-18_11_58/packet_rosbag`，只包含前中雷达。可用 `bag:=...` 覆盖回放输入，或用 `--bag` 覆盖测试输入。Thor 使用 Jazzy，Orin 和联想使用 Humble。
 
-- `tests/verify_end_to_end.py <基准目录> <全新输出目录> --levels 1 3 7` 启动实际回放、压缩、解压和录制进程。点云 bag 与摘要写入输出目录。
-- `tests/verify_calibration_order.py <压缩包目录>` 从已有包抽取真实帧和两套表，核对首表前跳过、同时间按消息顺序、换表后生效、全程无表零输出。
-- `tests/verify_cloud_decoder_node.py <压缩包目录> <PCD基准目录>` 验证在线换表和无效表处理，PCD 基准目录应包含 `front_mid`、`rear_mid`。
-- `tests/verify_rosbag.py` 核对原始包恢复、Zstd 等级元数据、标定校验及首表发布策略。此回归用原始 bag 和独立的 Python RBP3 解码器做字节核对。
+```bash
+source ~/lidar_super_packet_mode_build/install/setup.bash
+ros2 launch robinw_packet_frame replay_packet_bag.launch.py
+python3 ~/lidar_super_packet_mode/tests/verify_end_to_end.py
+```
 
-在 Thor 上，全流程所用的历史基准目录为
-`/home/agx/packet_data_compression/1103beicai_10_51_46_trial/recordings/zstd_e2e_1_3_7.fPg84P`。
-大文件数据和 PCD 保留在试验目录或外部验收目录，源码包中保留测试程序、配置和验收日志。
+同一份实车录包生成的新版压缩包位于同级 `compressed_rosbag`，可用以下命令导出。
 
-### RBP3 验收
+```bash
+capture=~/mikelee/seyond_capture_front_mid_2026_11_06-18_11_58
+ros2 run robinw_packet_frame compressed_bag_to_pcd \
+  "$capture/compressed_rosbag" /front_mid/compressed_packet_frame \
+  /front_mid/compressed_angle_calibration "$capture/pcd"
+```
+
+当前测试使用实车 packet 验证同表去重、换表、乱序匹配、缺包出点、压缩录包及 PCD 导出。旧压缩录包缺少新版消息字段，可从原始 packet 录包重新编码。历史测试和验收数据保留在旧版归档中。
+
+### 2026-11-05 RBP3 历史验收
 
 2026-11-05 在 Jetson Thor、ROS 2 Jazzy 上从正式工作区重新构建并验收。测试使用同一份前中、后中原始雷达包。两路均使用独立单帧预测。
 

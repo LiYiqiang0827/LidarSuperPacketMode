@@ -33,7 +33,18 @@ void export_clouds(const std::string & bag, const std::string & frame_topic,
     throw std::runtime_error("Bag has no frames on " + frame_topic);
   }
   std::filesystem::create_directories(output);
-  robinw::PointCloudDecoder decoder;
+  robinw::PointCloudDecoder decoder(0);
+  {
+    // A calibration can be recorded after its first frame on the other topic.
+    rosbag2_cpp::Reader tables;
+    tables.open(bag);
+    rosbag2_storage::StorageFilter only_calibration;
+    only_calibration.topics = {calibration_topic};
+    tables.set_filter(only_calibration);
+    while (tables.has_next()) {
+      decoder.update_calibration(read_message<robinw::Calibration>(*tables.read_next()));
+    }
+  }
   std::size_t saved = 0;
   std::size_t skipped = 0;
   std::size_t table_updates = 0;
@@ -41,18 +52,17 @@ void export_clouds(const std::string & bag, const std::string & frame_topic,
   while (reader.has_next()) {
     const auto message = reader.read_next();
     if (message->topic_name == calibration_topic) {
-      decoder.update_calibration(read_message<robinw::Calibration>(*message));
       ++table_updates;
-      continue;
-    }
-    if (!decoder.has_calibration()) {
-      ++skipped;
       continue;
     }
     const auto frame = read_message<robinw::Frame>(*message);
     try {
       const auto level = robinw::frame_zstd_level(frame.data);
       const auto cloud = decoder.decode(frame);
+      if (!cloud) {
+        ++skipped;
+        continue;
+      }
       const auto & stamp = cloud->header.stamp;
       const auto file = output / (formatTimestamp(stamp.sec, stamp.nanosec) + ".pcd");
       if (std::filesystem::exists(file) || !writePcd(file.string(), *cloud)) {
@@ -70,7 +80,7 @@ void export_clouds(const std::string & bag, const std::string & frame_topic,
     throw std::runtime_error("Bag has no frames on " + frame_topic);
   }
   std::cout << "Saved " << saved << " PCD files to " << output << '\n'
-            << "Skipped " << skipped << " frame(s) before first calibration; applied "
+            << "Skipped " << skipped << " frame(s) without matching calibration; read "
             << table_updates << " calibration update(s)\n";
 }
 }  // namespace

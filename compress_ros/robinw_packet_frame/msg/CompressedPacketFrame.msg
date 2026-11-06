@@ -9,3 +9,6 @@ uint32 uncompressed_size
 uint16 shuffle_block_size
 # Independent Zstd frame containing RBP3 headers and predicted point fields, plus a Zstd metadata trailer.
 uint8[] data
+# First 16 bytes of SHA-256 of the calibration version and effective angle table.
+# All zeroes in a frame mean that the encoder had no valid calibration for it.
+uint8[16] calibration_id
